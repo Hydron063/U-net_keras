@@ -1,41 +1,25 @@
 import os
-
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-import math
-from tqdm import tqdm_notebook, tqdm
-from skimage.draw import ellipse, polygon
 
 from keras import Model
 from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from keras.models import load_model
 from keras.optimizers import Adam
-from keras.layers import Input, Conv2D, Conv2DTranspose, MaxPooling2D, concatenate, Dropout
+from keras.layers import Input, Conv3D, Conv3DTranspose, MaxPooling3D, concatenate, Dropout
 from keras.losses import binary_crossentropy
+from keras import backend as K
+from keras.utils.generic_utils import get_custom_objects
+
 import tensorflow as tf
 # import tensorflow_datasets
-import keras as keras
 
-from keras import backend as K
-from tqdm import tqdm_notebook
-
-from keras.utils.generic_utils import get_custom_objects
-import pydicom
+import pydicom as dicom
 import dicom_numpy as dn
+import SimpleITK as sitk
+from mayavi import mlab
 
-w_size = 256
-train_num = 4096
-# les x sont les images, les y - les masques; ils sont remplis dans la fonction next_pair
-train_x = np.zeros((train_num, w_size, w_size, 3), dtype='float32')
-train_y = np.zeros((train_num, w_size, w_size, 1), dtype='float32')
-
-# les exemples des images remplies de l'eau/fond et des vaisseaux; les autres images sont construites de leurs parties
-img_l = np.random.sample((w_size, w_size, 3)) * 0.5
-img_h = np.random.sample((w_size, w_size, 3)) * 0.5 + 0.5
-
-radius_min = 10
-radius_max = 30
+start_neurons = 16
 
 
 # dice = 2*intersection/union
@@ -57,160 +41,153 @@ def dice_loss(y_true, y_pred):
     return 1. - score
 
 
-def bce_dice_loss(y_true, y_pred):
-    return binary_crossentropy(y_true, y_pred) + dice_loss(y_true, y_pred)
+# Index de Jaccard = intersection/union; distance de Jaccard = 1-index
+def jaccard_distance_loss(y_true, y_pred):
+    smooth = 100.
+    intersection = K.sum(K.abs(y_true * y_pred), axis=-1)
+    sum_ = K.sum(K.abs(y_true) + K.abs(y_pred), axis=-1)
+    jac = (intersection + smooth) / (sum_ - intersection + smooth)
+    return (1 - jac) * smooth
 
 
-def get_iou_vector(A, B):
-    # Numpy version
-
-    batch_size = A.shape[0]
-    metric = 0.0
-    for batch in range(batch_size):
-        t, p = A[batch], B[batch]
-        true = np.sum(t)
-        pred = np.sum(p)
-
-        # deal with empty mask first
-        if true == 0:
-            metric += (pred == 0)
-            continue
-
-        # non empty mask case.  Union is never empty
-        # hence it is safe to divide by its number of pixels
-        intersection = np.sum(t * p)
-        union = true + pred - intersection
-        iou = intersection / union
-
-        # iou metric is a stepwise approximation of the real iou over 0.5
-        iou = np.floor(max(0, (iou - 0.45) * 20)) / 10
-
-        metric += iou
-
-    # take the average over all images in batch
-    metric /= batch_size
-    return metric
+def bce_jaccard_loss(y_true, y_pred):
+    return binary_crossentropy(y_true, y_pred)+jaccard_distance_loss(y_true, y_pred)
 
 
-def my_iou_metric(label, pred):
-    # Tensorflow version
-    return tf.py_func(get_iou_vector, [label, pred > 0.5], tf.float64)
-
-
-get_custom_objects().update({'bce_dice_loss': bce_dice_loss})
-get_custom_objects().update({'dice_loss': dice_loss})
-get_custom_objects().update({'dice_coef': dice_coef})
-get_custom_objects().update({'my_iou_metric': my_iou_metric})
+def dice_metric(label, pred):
+    return tf.py_func(dice_loss, [label, pred], tf.float64)
 
 
 def build_model(input_layer, start_neurons):
-    conv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(input_layer)
-    conv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(conv1)
-    pool1 = MaxPooling2D((2, 2))(conv1)
+    conv1 = Conv3D(start_neurons * 1, (3, 3, 3), activation="relu", padding="same")(input_layer)
+    conv1 = Conv3D(start_neurons * 1, (3, 3, 3), activation="relu", padding="same")(conv1)
+    pool1 = MaxPooling3D((2, 2, 2), padding="same")(conv1)
     pool1 = Dropout(0.25)(pool1)
 
-    conv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(pool1)
-    conv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(conv2)
-    pool2 = MaxPooling2D((2, 2))(conv2)
+    conv2 = Conv3D(start_neurons * 2, (3, 3, 3), activation="relu", padding="same")(pool1)
+    conv2 = Conv3D(start_neurons * 2, (3, 3, 3), activation="relu", padding="same")(conv2)
+    pool2 = MaxPooling3D((2, 2, 2), padding="same")(conv2)
     pool2 = Dropout(0.5)(pool2)
 
-    conv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(pool2)
-    conv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(conv3)
-    pool3 = MaxPooling2D((2, 2))(conv3)
+    conv3 = Conv3D(start_neurons * 4, (3, 3, 3), activation="relu", padding="same")(pool2)
+    conv3 = Conv3D(start_neurons * 4, (3, 3, 3), activation="relu", padding="same")(conv3)
+    pool3 = MaxPooling3D((2, 2, 2), padding="same")(conv3)
     pool3 = Dropout(0.5)(pool3)
 
-    conv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(pool3)
-    conv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(conv4)
-    pool4 = MaxPooling2D((2, 2))(conv4)
+    conv4 = Conv3D(start_neurons * 8, (3, 3, 3), activation="relu", padding="same")(pool3)
+    conv4 = Conv3D(start_neurons * 8, (3, 3, 3), activation="relu", padding="same")(conv4)
+    pool4 = MaxPooling3D((2, 2, 2), padding="same")(conv4)
     pool4 = Dropout(0.5)(pool4)
 
     # Middle
-    convm = Conv2D(start_neurons * 16, (3, 3), activation="relu", padding="same")(pool4)
-    convm = Conv2D(start_neurons * 16, (3, 3), activation="relu", padding="same")(convm)
+    convm = Conv3D(start_neurons * 16, (3, 3, 3), activation="relu", padding="same")(pool4)
+    convm = Conv3D(start_neurons * 16, (3, 3, 3), activation="relu", padding="same")(convm)
 
-    deconv4 = Conv2DTranspose(start_neurons * 8, (3, 3), strides=(2, 2), padding="same")(convm)
+    deconv4 = Conv3DTranspose(start_neurons * 8, (3, 3, 3), strides=(2, 2, 2), padding="same")(convm)
     uconv4 = concatenate([deconv4, conv4])
     uconv4 = Dropout(0.5)(uconv4)
-    uconv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(uconv4)
-    uconv4 = Conv2D(start_neurons * 8, (3, 3), activation="relu", padding="same")(uconv4)
+    uconv4 = Conv3D(start_neurons * 8, (3, 3, 3), activation="relu", padding="same")(uconv4)
+    uconv4 = Conv3D(start_neurons * 8, (3, 3, 3), activation="relu", padding="same")(uconv4)
 
-    deconv3 = Conv2DTranspose(start_neurons * 4, (3, 3), strides=(2, 2), padding="same")(uconv4)
+    deconv3 = Conv3DTranspose(start_neurons * 4, (3, 3, 3), strides=(2, 2, 2), padding="same")(uconv4)
     uconv3 = concatenate([deconv3, conv3])
     uconv3 = Dropout(0.5)(uconv3)
-    uconv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(uconv3)
-    uconv3 = Conv2D(start_neurons * 4, (3, 3), activation="relu", padding="same")(uconv3)
+    uconv3 = Conv3D(start_neurons * 4, (3, 3, 3), activation="relu", padding="same")(uconv3)
+    uconv3 = Conv3D(start_neurons * 4, (3, 3, 3), activation="relu", padding="same")(uconv3)
 
-    deconv2 = Conv2DTranspose(start_neurons * 2, (3, 3), strides=(2, 2), padding="same")(uconv3)
+    deconv2 = Conv3DTranspose(start_neurons * 2, (3, 3, 3), strides=(2, 2, 2), padding="same")(uconv3)
     uconv2 = concatenate([deconv2, conv2])
     uconv2 = Dropout(0.5)(uconv2)
-    uconv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(uconv2)
-    uconv2 = Conv2D(start_neurons * 2, (3, 3), activation="relu", padding="same")(uconv2)
+    uconv2 = Conv3D(start_neurons * 2, (3, 3, 3), activation="relu", padding="same")(uconv2)
+    uconv2 = Conv3D(start_neurons * 2, (3, 3, 3), activation="relu", padding="same")(uconv2)
 
-    deconv1 = Conv2DTranspose(start_neurons * 1, (3, 3), strides=(2, 2), padding="same")(uconv2)
+    deconv1 = Conv3DTranspose(start_neurons * 1, (3, 3, 3), strides=(2, 2, 2), padding="same")(uconv2)
     uconv1 = concatenate([deconv1, conv1])
     uconv1 = Dropout(0.5)(uconv1)
-    uconv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(uconv1)
-    uconv1 = Conv2D(start_neurons * 1, (3, 3), activation="relu", padding="same")(uconv1)
+    uconv1 = Conv3D(start_neurons * 1, (3, 3, 3), activation="relu", padding="same")(uconv1)
+    uconv1 = Conv3D(start_neurons * 1, (3, 3, 3), activation="relu", padding="same")(uconv1)
 
     uconv1 = Dropout(0.5)(uconv1)
-    output_layer = Conv2D(1, (1, 1), padding="same", activation="sigmoid")(uconv1)
+    output_layer = Conv3D(1, (1, 1, 1), padding="same", activation="sigmoid")(uconv1)
 
     return output_layer
 
 
-# generation d'un pair image/masque
-def next_pair():
-    p = np.random.sample() - 0.5  # n'utilisons encore pas
-    # r,c - les coordonees du centre de l'ellipse
-    r = np.random.sample() * (w_size - 2 * radius_max) + radius_max
-    c = np.random.sample() * (w_size - 2 * radius_max) + radius_max
-    # le grand et le petit radius
-    r_radius = np.random.sample() * (radius_max - radius_min) + radius_min
-    c_radius = np.random.sample() * (radius_max - radius_min) + radius_min
-    rot = np.random.sample() * 360  # pente de l'ellipse
-    rr, cc = ellipse(
-        r, c,
-        r_radius, c_radius,
-        rotation=np.deg2rad(rot),
-        shape=img_l.shape
-    )  # obtenons tous les points de l'ellipse
-
-    # peignons les pixels de la mer/du fond par le bruit de 0.5 a 1.0
-    img = img_h.copy()
-    # peignons les pixels de l'ellipse par le bruit de 0 a 0.5
-    img[rr, cc] = img_l[rr, cc]
-
-    msk = np.zeros((w_size, w_size, 1), dtype='float32')
-    msk[rr, cc] = 1.  # peignons les pixels selon la masque de l'ellipse
-
-    return img, msk
+def extract_voxel_data(DCM_files):
+    datasets = [dicom.read_file(f) for f in DCM_files]
+    try:
+        voxel_ndarray, ijk_to_xyz = dn.combine_slices(datasets)
+    except dn.DicomImportException as e:
+        raise e
+    return voxel_ndarray
 
 
-for k in range(train_num):  # generation de tous les img train
-    img, msk = next_pair()
+def load_itk(filename):
+    # Reads the image using SimpleITK
+    itkimage = sitk.ReadImage(filename)
 
-    train_x[k] = img
-    train_y[k] = msk
+    # Convert the image to a  numpy array first and then shuffle the dimensions to get axis in the order z,y,x
+    ct_scan = sitk.GetArrayFromImage(itkimage)
 
-fig, axes = plt.subplots(2, 10, figsize=(20, 5))  # regardons les 10 premiers avec les masques
-for k in range(10):
-    axes[0, k].set_axis_off()
-    axes[0, k].imshow(train_x[k])
-    axes[1, k].set_axis_off()
-    axes[1, k].imshow(train_y[k].squeeze())
-plt.show()
+    # Read the origin of the ct_scan, will be used to convert the coordinates from world to voxel and vice versa.
+    origin = np.array(list(reversed(itkimage.GetOrigin())))
 
-input_layer = Input((w_size, w_size, 3))
-output_layer = build_model(input_layer, 16)
+    # Read the spacing along each dimension
+    spacing = np.array(list(reversed(itkimage.GetSpacing())))
+
+    return ct_scan, origin, spacing
+
+
+# telechargement de l'image (DICOM -> numpy)
+PathDicom = "./DICOM/1/"
+DCM_files = []
+for dirName, subdirList, fileList in os.walk(PathDicom):
+    for filename in fileList:
+        if ".dcm" in filename.lower():
+            DCM_files.append(os.path.join(dirName, filename))
+
+PathLabels = "./Label/"
+label_files = []
+for dirName, subdirList, fileList in os.walk(PathLabels):
+    for filename in fileList:
+        if ".mhd" in filename.lower():
+            label_files.append(os.path.join(dirName, filename))
+
+train_x = extract_voxel_data(DCM_files)
+
+# chaque element de train_y represente 1 cube de 256*256*136 + metadonnees
+train_y = [load_itk(label)[0] for label in label_files]
+
+# Complementer les y par les zeros
+# train_y = np.array(
+#     [np.concatenate((i, np.zeros((i.shape[0], i.shape[1], train_x.shape[2] - i.shape[2]))), axis=2) for i in train_y])
+train_y = np.array(train_y)
+train_x = np.array([train_x])
+
+train_x = train_x[:, :, :, 58:186]
+train_y = train_y[:, :, :, 4:132]
+
+enter_shape = train_x.shape + (1,)
+train_x = train_x.reshape(*enter_shape)
+train_y = train_y.reshape(*enter_shape)
+
+# Visualisation
+# train_y = np.array(train_y[0])
+# print(train_x.shape)
+# mlab.contour3d(train_y)
+# mlab.savefig('surface.obj')
+# input()
+#
+
+input_layer = Input(enter_shape[1:])
+output_layer = build_model(input_layer, start_neurons)
 model = Model(input_layer, output_layer)
-model.compile(loss=bce_dice_loss, optimizer=Adam(lr=1e-3), metrics=[my_iou_metric])
+model.compile(loss=bce_jaccard_loss, optimizer=Adam(lr=1e-3), metrics=dice_coef)
 model.save_weights('./keras.weights')
 
-while True:
-    history = model.fit(train_x, train_y,
-                        batch_size=32,
-                        epochs=1,
-                        verbose=1,
-                        validation_split=0.1)
-    if history.history['my_iou_metric'][0] > 0.75:
-        break
+history = model.fit(train_x, train_y,
+                    batch_size=1,
+                    epochs=1,
+                    verbose=1,
+                    validation_split=1)
+print(model.predict(train_x).shape)
