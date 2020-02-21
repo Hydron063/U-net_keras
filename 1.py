@@ -41,7 +41,7 @@ def dice_loss(y_true, y_pred):
     return 1. - score
 
 
-# Index de Jaccard = intersection/union; distance de Jaccard = 1-index
+# Jaccard index = intersection/union; Jaccard distance = 1-index
 def jaccard_distance_loss(y_true, y_pred):
     smooth = 100.
     intersection = K.sum(K.abs(y_true * y_pred), axis=-1)
@@ -155,10 +155,10 @@ for dirName, subdirList, fileList in os.walk(PathLabels):
 
 train_x = extract_voxel_data(DCM_files)
 
-# chaque element de train_y represente 1 cube de 256*256*136 + metadonnees
+# every element of train_y represent 1 cube of 256*256*136 + metadata
 train_y = [load_itk(label)[0] for label in label_files]
 
-# Complementer les y par les zeros
+# Complement y with zeros
 # train_y = np.array(
 #     [np.concatenate((i, np.zeros((i.shape[0], i.shape[1], train_x.shape[2] - i.shape[2]))), axis=2) for i in train_y])
 train_y = np.array(train_y)
